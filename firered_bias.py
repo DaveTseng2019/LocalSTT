@@ -107,12 +107,19 @@ class ContextBias:
 
 
 def set_hotwords(tokenizer, words: List[str], weight: float) -> int:
-    """設定這次請求的熱詞，回傳實際用上的詞數。含 <unk> 的詞（字典外的字）直接略過。"""
+    """設定這次請求的熱詞，回傳實際用上的詞數。含 <unk> 的詞（字表外的字）直接略過。
+
+    notes: 先轉簡體再切 token。FireRed 的字表只有簡體字（實測「時」「燈」「號」「組」「織」「圖」
+           都不在 dict.txt，對應的簡體字都在），ZeroType 的字典是繁體，不轉的話含這些字的詞
+           全部變成 <unk> 而被略過。輸出端 shim 本來就會再轉回繁體。
+    """
     global _current
+    from opencc import OpenCC
+    t2s = OpenCC("t2s")
     seqs = []
     unk = tokenizer.dict.unkid
     for w in words:
-        w = w.strip()
+        w = t2s.convert(w.strip())
         if not w:
             continue
         _, ids = tokenizer.tokenize(w)
