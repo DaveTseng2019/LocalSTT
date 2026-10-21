@@ -359,7 +359,7 @@ async def transcriptions(
             )
             text = clean(result["text"])
         elapsed = time.perf_counter() - t0
-        log(f"{elapsed:.2f}s {len(text)} 字：{text[:60]}")
+        log(f"[{ENGINE}] {elapsed:.2f}s {len(text)} 字：{text[:60]}")
     finally:
         Path(audio_path).unlink(missing_ok=True)
 
