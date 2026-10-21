@@ -285,11 +285,14 @@ def _firered_transcribe(audio_path: str, hotwords: str = "") -> str:
 @app.on_event("startup")
 def load_model() -> None:
     t0 = time.perf_counter()
+    # 給 /health 回報：ZeroType 設定頁顯示「幾點啟動、載入幾秒」
+    state["started_at"] = time.time()
     log(f"啟動中，載入模型（{ENGINE}）…")
     if ENGINE == "firered":
         _load_firered()
         warmup()
-        log(f"模型就緒 firered cuda，耗時 {time.perf_counter() - t0:.1f} 秒（已暖機）")
+        state["load_seconds"] = round(time.perf_counter() - t0, 1)
+        log(f"模型就緒 firered cuda，耗時 {state['load_seconds']:.1f} 秒（已暖機）")
         return
     device = resolve_device("auto")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -311,13 +314,16 @@ def load_model() -> None:
         dtype=dtype,
     )
     warmup()
-    log(f"模型就緒 {device}，耗時 {time.perf_counter() - t0:.1f} 秒（已暖機）")
+    state["load_seconds"] = round(time.perf_counter() - t0, 1)
+    log(f"模型就緒 {device}，耗時 {state['load_seconds']:.1f} 秒（已暖機）")
 
 
 @app.get("/health")
 def health() -> dict:
     ready = "system" in state if ENGINE == "firered" else "model" in state
-    return {"ok": ready, "engine": ENGINE, "device": str(state.get("device"))}
+    # started_at 是 Unix 秒數；load_seconds 在模型載完之前沒有值（None）。
+    return {"ok": ready, "engine": ENGINE, "device": str(state.get("device")),
+            "started_at": state.get("started_at"), "load_seconds": state.get("load_seconds")}
 
 
 @app.post("/shutdown")
