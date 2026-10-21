@@ -138,6 +138,9 @@ def _arg_value(name: str, default: str) -> str:
 
 ENGINE = _arg_value("--engine", "moss")
 FIRERED_DIR = Path(_arg_value("--firered-dir", str(Path(__file__).with_name("firered"))))
+# 熱詞加權（firered_bias.py）。實測 100 筆：3 命中 35/63、誤加 0；4.5 命中 44/63、誤加約 3；
+# 6 會開始亂插。誤加是逐筆人工判讀的，見 README。設 0 關閉。
+HOTWORD_WEIGHT = float(_arg_value("--hotword-weight", "3.0"))
 
 if ENGINE == "moss":
     from transformers import AutoModelForCausalLM, AutoProcessor
@@ -227,6 +230,9 @@ def _load_firered() -> None:
     import logging
     logging.getLogger("fireredasr2s").setLevel(logging.WARNING)
 
+    import firered_bias
+    firered_bias.install()
+
     pm = FIRERED_DIR / "pretrained_models"
     system = FireRedAsr2System(FireRedAsr2SystemConfig(
         vad_model_dir=str(pm / "FireRedVAD" / "VAD"),
@@ -242,10 +248,15 @@ def _load_firered() -> None:
     state.update(system=system, device=torch.device("cuda"))
 
 
-def _firered_transcribe(audio_path: str) -> str:
-    """轉成 16 kHz 單聲道 16-bit 再送進 FireRed。ZeroType 錄的是 44.1 kHz。"""
+def _firered_transcribe(audio_path: str, hotwords: str = "") -> str:
+    """轉成 16 kHz 單聲道 16-bit 再送進 FireRed。ZeroType 錄的是 44.1 kHz。
+
+    hotwords 是 ZeroType 送來的「、」分隔詞彙，用 firered_bias 在解碼時加權。
+    """
     import soundfile as sf
     import torchaudio
+
+    import firered_bias
 
     data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
     wav = torch.from_numpy(data.mean(axis=1))
@@ -260,7 +271,13 @@ def _firered_transcribe(audio_path: str) -> str:
         # notes: 直接改共用的 config 旗標。端點是 async def 裡跑同步推論，請求本來就一次一個，
         #        不會有兩個請求同時讀到這個值。改成真正並行之前要換成每次請求各自的設定。
         system.config.enable_vad = duration > FIRERED_NO_VAD_MAX_S
-        return system.process(path16, "zt")["text"]
+        words = [w.strip() for w in hotwords.split("、") if w.strip()]
+        firered_bias.set_hotwords(system.asr.tokenizer, words, HOTWORD_WEIGHT)
+        try:
+            text = system.process(path16, "zt")["text"]
+        finally:
+            firered_bias.set_hotwords(system.asr.tokenizer, [], 0)
+        return firered_bias.restore_case(text, words)
     finally:
         Path(path16).unlink(missing_ok=True)
 
@@ -342,8 +359,8 @@ async def transcriptions(
     try:
         t0 = time.perf_counter()
         if ENGINE == "firered":
-            # notes: FireRedASR2-AED 沒有熱詞或 prompt 輸入，字典詞彙在這個引擎上不起作用。
-            text = clean(_firered_transcribe(audio_path))
+            # FireRedASR2-AED 沒有文字輸入，熱詞改在 beam search 加權（firered_bias.py）。
+            text = clean(_firered_transcribe(audio_path, hotwords))
         else:
             instruction = TRANSCRIBE_PROMPT
             if hotwords.strip():
@@ -375,6 +392,8 @@ def main() -> None:
     # 這兩個也在模組層就讀過了（決定要 import 哪個引擎），這裡只是讓 argparse 收下並列進 --help。
     ap.add_argument("--engine", choices=["moss", "firered"], default="moss")
     ap.add_argument("--firered-dir", help="FireRedASR2S 的 clone，裡面要有 pretrained_models/")
+    ap.add_argument("--hotword-weight", type=float, default=3.0,
+                    help="FireRed 熱詞加權，0 關閉（預設 3.0）")
     # 這個旗標在檔案最上方就已經生效，這裡只是讓 argparse 不要拒收它。
     ap.add_argument("--hide-console", action="store_true",
                     help="啟動後把主控台視窗藏起來（ZeroType 預設會帶這個旗標）")
