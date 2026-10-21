@@ -1,10 +1,14 @@
 # LocalSTT
 
-本機語音辨識端點。把 MOSS-Transcribe-Diarize 0.9B 包成 OpenAI 相容的轉寫 API，
+本機語音辨識端點。把本機語音辨識模型包成 OpenAI 相容的轉寫 API，
 給 ZeroType 當語音輸入後端。所有推論都在本機 GPU 上執行。不上雲，不計費。
 
-模型：[OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)（Apache-2.0）。
-權重 revision `704aa4a9c304e8520be88901e0d1960158ef5b15`。
+有兩個引擎，用 `--engine` 選。兩者的相依套件互斥，所以各用各的虛擬環境啟動：
+
+| 引擎 | 模型 | 虛擬環境 |
+|---|---|---|
+| `moss`（預設） | [OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize) 0.9B（Apache-2.0），權重 revision `704aa4a9c304e8520be88901e0d1960158ef5b15` | `repo/.venv`（ZeroType 預設找這個） |
+| `firered` | [FireRedTeam/FireRedASR2-AED](https://github.com/FireRedTeam/FireRedASR2S)（Apache-2.0）＋ FireRedVAD ＋ FireRedPunc | 另外建，見「FireRed 引擎」 |
 
 ## 需求
 
@@ -91,7 +95,7 @@ C:\Learning\LocalSTT\install-autostart.ps1
 
 | 路徑 | 用途 |
 |---|---|
-| `shim.py` | OpenAI 相容端點。含暖機、剝時間戳標記、簡轉繁 |
+| `shim.py` | OpenAI 相容端點。含兩個引擎、暖機、剝時間戳標記、簡轉繁 |
 | `start.ps1` | 啟動腳本 |
 | `shim.log` | 端點記錄，ZeroType 讀這個檔顯示。每次啟動清空 |
 | `install-autostart.ps1` | 註冊／移除登入自啟的工作排程項目 |
@@ -114,6 +118,63 @@ uv pip install fastapi uvicorn python-multipart opencc
 
 首次執行 `shim.py` 會自動從 Hugging Face 下載權重。
 
+## FireRed 引擎
+
+### 建立環境
+
+FireRedASR2S 官方只在 Ubuntu 測過，但在 Windows 可以跑（2026-10-21 實測）。
+官方 `requirements.txt` 釘的是 torch 2.1.0+cu118，這裡改用 cu126 的新版 torch：
+
+```powershell
+git clone --depth 1 https://github.com/FireRedTeam/FireRedASR2S.git <FireRed資料夾>\repo
+uv venv --python 3.10 <FireRed資料夾>\.venv
+$py = "<FireRed資料夾>\.venv\Scripts\python.exe"
+uv pip install --python $py torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+uv pip install --python $py "transformers==4.51.3" "numpy<2" cn2an kaldiio kaldi_native_fbank sentencepiece soundfile textgrid "peft>=0.13.2" huggingface_hub fastapi uvicorn python-multipart opencc
+foreach ($m in "FireRedASR2-AED","FireRedVAD","FireRedPunc") { & "<FireRed資料夾>\.venv\Scripts\hf.exe" download "FireRedTeam/$m" --local-dir "<FireRed資料夾>\repo\pretrained_models\$m" }
+```
+
+**還要修一行上游程式碼。** `fireredasr2s/fireredasr2/models/fireredasr_aed.py` 的
+`forced_align` 不收 bf16。`use_half=True` 時每一句都在那裡丟例外，再被裸 `except` 吞掉，
+時間戳靜默變成 `None`。把 `n_ctc_logits.unsqueeze(0)` 改成 `n_ctc_logits.float().unsqueeze(0)`。
+shim 本身不用時間戳（`return_timestamp=False`），所以不修也能辨識；要拿這份 clone 做字幕時才需要。
+
+### 跟 ZeroType 一起用
+
+在 ZeroType 的「啟動設定（進階）」填：
+
+| 欄位 | 值 |
+|---|---|
+| 程式 | `<FireRed資料夾>\.venv\Scripts\python.exe` |
+| 參數 | `<LocalSTT資料夾>\shim.py --engine firered --firered-dir <FireRed資料夾>\repo` |
+| 記錄檔 | 留空（預設就是 `shim.py` 旁邊的 `shim.log`） |
+
+存檔後在 ZeroType 按「停止」再「啟動」。`shim.log` 出現 `模型就緒 firered cuda` 就是換好了。
+要換回 MOSS，三個欄位清空即可。
+
+### 跟 MOSS 的差別
+
+2026-10-21 用 60 筆近期 ZeroType 錄音實測。**原本那 55 筆的音檔已被 ZeroType 清掉**，
+所以對照文字是 MOSS 當時的輸出，不是人工校對。下面的差異只能說明「兩者不同」，不能說明誰比較準。
+
+| 項目 | 結果 |
+|---|---|
+| 去標點後與 MOSS 完全相同 | 31 / 60 筆 |
+| 去標點後字元差異中位數 | 0 |
+| 延遲中位數 | 0.47 秒（第一句 2.9 秒，所以要暖機） |
+| VRAM 峰值 | 約 2.7 GB（MOSS 約 1.8 GB） |
+
+從差異逐筆看到的傾向（判讀，沒有音檔可對）：
+
+- FireRed 對中文詞較準：有幾筆會計與專案用語 MOSS 寫錯，FireRed 寫對。
+- FireRed 對英文詞較差：英文產品名、系統名、英文人名大多寫錯，常被音譯成中文。
+- FireRed 把數字寫成國字（例如五位數的編號被逐字寫成國字）。
+- **FireRed 沒有熱詞輸入**，ZeroType 字典的詞彙在這個引擎上不起作用。
+
+**短句不走 VAD。** 走 VAD 時每個停頓都被切成一段、各自補句號（「若我想。知道這一個影片裡面的。字幕。」）。
+50 秒以下的錄音整段直接送，句號數中位數從 1.5 降到 1，與 MOSS 的字元差異中位數從 0.036 降到 0。
+超過 50 秒才走 VAD，因為 AED 一段最多 60 秒。
+
 ## 熱詞怎麼送
 
 ZeroType 的字典詞彙以 `hotwords` 表單欄位送進來，shim 再接到轉寫指令後面。
@@ -123,6 +184,8 @@ ZeroType 的字典詞彙以 `hotwords` 表單欄位送進來，shim 再接到轉
 會把 prompt 裡的指令本身當答案抄出來。詞彙列表沒有指令語氣，抄出來的風險低得多。
 
 同樣的理由，shim 刻意完全忽略 `prompt` 欄位。
+
+FireRed 引擎收到 `hotwords` 也會忽略，因為模型沒有這種輸入。
 
 ## 待辦
 
