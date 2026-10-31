@@ -356,8 +356,7 @@ async def transcriptions(
 ) -> dict:
     # notes: ZeroType 送來的 prompt 是給 chat 型模型的整段指令。原封不動餵給 MOSS，
     #        它會在音訊內容偏弱時把指令本身當答案抄出來（ZeroType 自己的註解也記了
-    #        同一個現象）。所以指令固定用 TRANSCRIBE_PROMPT。
-    #        hotwords 只給 FireRed 用；MOSS 自 2026-10-31 起不接熱詞，使用者選擇讓流程單純。
+    #        同一個現象）。所以指令固定用 TRANSCRIBE_PROMPT，只把熱詞接上去。
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         shutil.copyfileobj(file.file, tmp)
@@ -369,10 +368,13 @@ async def transcriptions(
             # FireRedASR2-AED 沒有文字輸入，熱詞改在 beam search 加權（firered_bias.py）。
             text = clean(_firered_transcribe(audio_path, hotwords))
         else:
+            instruction = TRANSCRIBE_PROMPT
+            if hotwords.strip():
+                instruction = f"{instruction}熱詞提示：{hotwords.strip()}"
             result = generate_transcription(
                 state["model"],
                 state["processor"],
-                build_transcription_messages(audio_path, prompt=TRANSCRIBE_PROMPT),
+                build_transcription_messages(audio_path, prompt=instruction),
                 max_new_tokens=2048,
                 do_sample=False,
                 device=state["device"],
