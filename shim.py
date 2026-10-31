@@ -3,8 +3,7 @@
 ZeroType 設定：語音辨識服務商選「本機」。沒有 API Key 欄位，端點也不必填。
 
 啟動：repo/.venv/Scripts/python.exe shim.py [--port 8123] [--host 127.0.0.1]
-引擎：--engine moss（預設，MOSS-Transcribe-Diarize）或 --engine firered --firered-dir <FireRedASR2S clone>。
-兩個引擎的相依套件互斥，各用各的虛擬環境啟動，見 README。
+引擎：MOSS-Transcribe-Diarize。FireRed 引擎已在 2026-10-31 移除（git 歷史保留）。
 """
 
 import argparse
@@ -136,28 +135,18 @@ def _arg_value(name: str, default: str) -> str:
     return default
 
 
-ENGINE = _arg_value("--engine", "moss")
-FIRERED_DIR = Path(_arg_value("--firered-dir", str(Path(__file__).with_name("firered"))))
-# 熱詞加權（firered_bias.py）。實測 100 筆：3 命中 35/63、誤加 0；4.5 命中 44/63、誤加約 3；
-# 6 會開始亂插。誤加是逐筆人工判讀的，見 README。設 0 關閉。
-HOTWORD_WEIGHT = float(_arg_value("--hotword-weight", "3.0"))
+# /health 與記錄檔用的引擎名稱。只剩 MOSS 一個引擎。
+ENGINE = "moss"
 
-if ENGINE == "moss":
-    from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoProcessor
 
-    from moss_transcribe_diarize.inference_utils import (
-        build_transcription_messages,
-        generate_transcription,
-        resolve_device,
-    )
+from moss_transcribe_diarize.inference_utils import (
+    build_transcription_messages,
+    generate_transcription,
+    resolve_device,
+)
 
 MODEL_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
-
-# notes: FireRedASR2-AED 一段最多 60 秒（官方 README）。短於這個長度就整段直接送、不走 VAD：
-#        實測 60 筆 ZeroType 錄音，走 VAD 時每個停頓都被切成一段、各自補句號
-#        （「若我想。知道這一個影片裡面的。字幕。」），整段送之後句號數中位數從 1.5 降到 1，
-#        與 MOSS 去標點後的字元差異中位數從 0.036 降到 0。留 10 秒餘裕。
-FIRERED_NO_VAD_MAX_S = 50
 
 # 實測 55 筆真實錄音，這組 prompt 的字元差異中位數 0.071，比內建預設的 0.130 好，
 # 而且輸出 token 少一個量級（RTF 0.06 對 0.145）。
@@ -192,7 +181,6 @@ def warmup() -> None:
 
     notes: 第一次推論含 CUDA kernel 載入，實測 8.4 秒音檔要 5.2 秒，穩態只要 0.5 秒。
            不暖機的話「開機後第一句」會慢一個量級，那正是最有感的一句。
-           FireRed 同樣成立：60 筆實測第一筆 2.9 秒，其餘中位數 0.47 秒。
     """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         path = tmp.name
@@ -202,9 +190,6 @@ def warmup() -> None:
             w.setsampwidth(2)
             w.setframerate(16000)
             w.writeframes(bytes(32000))  # 一秒 16 kHz 16-bit 靜音
-        if ENGINE == "firered":
-            _firered_transcribe(path)
-            return
         generate_transcription(
             state["model"],
             state["processor"],
@@ -218,82 +203,12 @@ def warmup() -> None:
         Path(path).unlink(missing_ok=True)
 
 
-def _load_firered() -> None:
-    sys.path.insert(0, str(FIRERED_DIR))
-    from fireredasr2s.fireredasr2 import FireRedAsr2Config
-    from fireredasr2s.fireredasr2system import FireRedAsr2System, FireRedAsr2SystemConfig
-    from fireredasr2s.fireredpunc import FireRedPuncConfig
-    from fireredasr2s.fireredvad import FireRedVadConfig
-
-    # notes: fireredasr2system 在 import 時設 basicConfig(INFO)，每一句都把 VAD／ASR／Punc 的
-    #        完整結果各記一行。那會把 shim.log 的每句一行洗成每句四行，ZeroType 只顯示最後 40 行。
-    import logging
-    logging.getLogger("fireredasr2s").setLevel(logging.WARNING)
-
-    import firered_bias
-    firered_bias.install()
-
-    pm = FIRERED_DIR / "pretrained_models"
-    system = FireRedAsr2System(FireRedAsr2SystemConfig(
-        vad_model_dir=str(pm / "FireRedVAD" / "VAD"),
-        asr_type="aed",
-        asr_model_dir=str(pm / "FireRedASR2-AED"),
-        punc_model_dir=str(pm / "FireRedPunc"),
-        vad_config=FireRedVadConfig(use_gpu=True),
-        # bf16：實測與 fp32 文字相同、快 14 倍；fp32 約 5 GB，6 GB 顯示卡會溢出到系統記憶體。
-        asr_config=FireRedAsr2Config(use_gpu=True, use_half=True, return_timestamp=False),
-        punc_config=FireRedPuncConfig(use_gpu=True),
-        enable_lid=False,
-    ))
-    state.update(system=system, device=torch.device("cuda"))
-
-
-def _firered_transcribe(audio_path: str, hotwords: str = "") -> str:
-    """轉成 16 kHz 單聲道 16-bit 再送進 FireRed。ZeroType 錄的是 44.1 kHz。
-
-    hotwords 是 ZeroType 送來的「、」分隔詞彙，用 firered_bias 在解碼時加權。
-    """
-    import soundfile as sf
-    import torchaudio
-
-    import firered_bias
-
-    data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
-    wav = torch.from_numpy(data.mean(axis=1))
-    if sr != 16000:
-        wav = torchaudio.functional.resample(wav, sr, 16000)
-    duration = wav.numel() / 16000
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        path16 = tmp.name
-    try:
-        sf.write(path16, wav.clamp(-1, 1).numpy(), 16000, subtype="PCM_16")
-        system = state["system"]
-        # notes: 直接改共用的 config 旗標。端點是 async def 裡跑同步推論，請求本來就一次一個，
-        #        不會有兩個請求同時讀到這個值。改成真正並行之前要換成每次請求各自的設定。
-        system.config.enable_vad = duration > FIRERED_NO_VAD_MAX_S
-        words = [w.strip() for w in hotwords.split("、") if w.strip()]
-        firered_bias.set_hotwords(system.asr.tokenizer, words, HOTWORD_WEIGHT)
-        try:
-            text = system.process(path16, "zt")["text"]
-        finally:
-            firered_bias.set_hotwords(system.asr.tokenizer, [], 0)
-        return firered_bias.restore_case(text, words)
-    finally:
-        Path(path16).unlink(missing_ok=True)
-
-
 @app.on_event("startup")
 def load_model() -> None:
     t0 = time.perf_counter()
     # 給 /health 回報：ZeroType 設定頁顯示「幾點啟動、載入幾秒」
     state["started_at"] = time.time()
     log(f"啟動中，載入模型（{ENGINE}）…")
-    if ENGINE == "firered":
-        _load_firered()
-        warmup()
-        state["load_seconds"] = round(time.perf_counter() - t0, 1)
-        log(f"模型就緒 firered cuda，耗時 {state['load_seconds']:.1f} 秒（已暖機）")
-        return
     device = resolve_device("auto")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model = (
@@ -320,7 +235,7 @@ def load_model() -> None:
 
 @app.get("/health")
 def health() -> dict:
-    ready = "system" in state if ENGINE == "firered" else "model" in state
+    ready = "model" in state
     # started_at 是 Unix 秒數；load_seconds 在模型載完之前沒有值（None）。
     return {"ok": ready, "engine": ENGINE, "device": str(state.get("device")),
             "started_at": state.get("started_at"), "load_seconds": state.get("load_seconds")}
@@ -364,23 +279,19 @@ async def transcriptions(
 
     try:
         t0 = time.perf_counter()
-        if ENGINE == "firered":
-            # FireRedASR2-AED 沒有文字輸入，熱詞改在 beam search 加權（firered_bias.py）。
-            text = clean(_firered_transcribe(audio_path, hotwords))
-        else:
-            instruction = TRANSCRIBE_PROMPT
-            if hotwords.strip():
-                instruction = f"{instruction}熱詞提示：{hotwords.strip()}"
-            result = generate_transcription(
-                state["model"],
-                state["processor"],
-                build_transcription_messages(audio_path, prompt=instruction),
-                max_new_tokens=2048,
-                do_sample=False,
-                device=state["device"],
-                dtype=state["dtype"],
-            )
-            text = clean(result["text"])
+        instruction = TRANSCRIBE_PROMPT
+        if hotwords.strip():
+            instruction = f"{instruction}熱詞提示：{hotwords.strip()}"
+        result = generate_transcription(
+            state["model"],
+            state["processor"],
+            build_transcription_messages(audio_path, prompt=instruction),
+            max_new_tokens=2048,
+            do_sample=False,
+            device=state["device"],
+            dtype=state["dtype"],
+        )
+        text = clean(result["text"])
         elapsed = time.perf_counter() - t0
         log(f"[{ENGINE}] {elapsed:.2f}s {len(text)} 字：{text[:60]}")
     finally:
@@ -395,11 +306,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8123)
-    # 這兩個也在模組層就讀過了（決定要 import 哪個引擎），這裡只是讓 argparse 收下並列進 --help。
-    ap.add_argument("--engine", choices=["moss", "firered"], default="moss")
-    ap.add_argument("--firered-dir", help="FireRedASR2S 的 clone，裡面要有 pretrained_models/")
-    ap.add_argument("--hotword-weight", type=float, default=3.0,
-                    help="FireRed 熱詞加權，0 關閉（預設 3.0）")
+    # 只剩 moss。ZeroType 選單若仍選 FireRed，會帶 --engine firered，這裡直接報錯而不是默默換成 MOSS。
+    ap.add_argument("--engine", choices=["moss"], default="moss")
     # 這個旗標在檔案最上方就已經生效，這裡只是讓 argparse 不要拒收它。
     ap.add_argument("--hide-console", action="store_true",
                     help="啟動後把主控台視窗藏起來（ZeroType 預設會帶這個旗標）")

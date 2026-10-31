@@ -3,12 +3,10 @@
 本機語音辨識端點。把本機語音辨識模型包成 OpenAI 相容的轉寫 API，
 給 ZeroType 當語音輸入後端。所有推論都在本機 GPU 上執行。不上雲，不計費。
 
-有兩個引擎，用 `--engine` 選。兩者的相依套件互斥，所以各用各的虛擬環境啟動：
+引擎是 [OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize) 0.9B
+（Apache-2.0），權重 revision `704aa4a9c304e8520be88901e0d1960158ef5b15`，虛擬環境在 `repo/.venv`（ZeroType 預設找這個）。
 
-| 引擎 | 模型 | 虛擬環境 |
-|---|---|---|
-| `moss`（預設） | [OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize) 0.9B（Apache-2.0），權重 revision `704aa4a9c304e8520be88901e0d1960158ef5b15` | `repo/.venv`（ZeroType 預設找這個） |
-| `firered` | [FireRedTeam/FireRedASR2-AED](https://github.com/FireRedTeam/FireRedASR2S)（Apache-2.0）＋ FireRedVAD ＋ FireRedPunc | 另外建，見「FireRed 引擎」 |
+FireRed 引擎曾經存在，2026-10-31 移除，見最後的「FireRed 引擎（已移除）」。
 
 ## 需求
 
@@ -95,8 +93,7 @@ C:\Learning\LocalSTT\install-autostart.ps1
 
 | 路徑 | 用途 |
 |---|---|
-| `shim.py` | OpenAI 相容端點。含兩個引擎、暖機、剝時間戳標記、簡轉繁 |
-| `firered_bias.py` | FireRed 引擎的熱詞加權 |
+| `shim.py` | OpenAI 相容端點。含暖機、剝時間戳標記、簡轉繁 |
 | `start.ps1` | 啟動腳本 |
 | `shim.log` | 端點記錄，ZeroType 讀這個檔顯示。每次啟動清空 |
 | `install-autostart.ps1` | 註冊／移除登入自啟的工作排程項目 |
@@ -119,63 +116,6 @@ uv pip install fastapi uvicorn python-multipart opencc
 
 首次執行 `shim.py` 會自動從 Hugging Face 下載權重。
 
-## FireRed 引擎
-
-### 建立環境
-
-FireRedASR2S 官方只在 Ubuntu 測過，但在 Windows 可以跑（2026-10-21 實測）。
-官方 `requirements.txt` 釘的是 torch 2.1.0+cu118，這裡改用 cu126 的新版 torch：
-
-```powershell
-git clone --depth 1 https://github.com/FireRedTeam/FireRedASR2S.git <FireRed資料夾>\repo
-uv venv --python 3.10 <FireRed資料夾>\.venv
-$py = "<FireRed資料夾>\.venv\Scripts\python.exe"
-uv pip install --python $py torch torchaudio --index-url https://download.pytorch.org/whl/cu126
-uv pip install --python $py "transformers==4.51.3" "numpy<2" cn2an kaldiio kaldi_native_fbank sentencepiece soundfile textgrid "peft>=0.13.2" huggingface_hub fastapi uvicorn python-multipart opencc
-foreach ($m in "FireRedASR2-AED","FireRedVAD","FireRedPunc") { & "<FireRed資料夾>\.venv\Scripts\hf.exe" download "FireRedTeam/$m" --local-dir "<FireRed資料夾>\repo\pretrained_models\$m" }
-```
-
-**還要修一行上游程式碼。** `fireredasr2s/fireredasr2/models/fireredasr_aed.py` 的
-`forced_align` 不收 bf16。`use_half=True` 時每一句都在那裡丟例外，再被裸 `except` 吞掉，
-時間戳靜默變成 `None`。把 `n_ctc_logits.unsqueeze(0)` 改成 `n_ctc_logits.float().unsqueeze(0)`。
-shim 本身不用時間戳（`return_timestamp=False`），所以不修也能辨識；要拿這份 clone 做字幕時才需要。
-
-### 跟 ZeroType 一起用
-
-在 ZeroType 的「啟動設定（進階）」填：
-
-| 欄位 | 值 |
-|---|---|
-| 程式 | `<FireRed資料夾>\.venv\Scripts\python.exe` |
-| 參數 | `<LocalSTT資料夾>\shim.py --engine firered --firered-dir <FireRed資料夾>\repo` |
-| 記錄檔 | 留空（預設就是 `shim.py` 旁邊的 `shim.log`） |
-
-存檔後在 ZeroType 按「停止」再「啟動」。`shim.log` 出現 `模型就緒 firered cuda` 就是換好了。
-要換回 MOSS，三個欄位清空即可。
-
-### 跟 MOSS 的差別
-
-2026-10-21 用 60 筆近期 ZeroType 錄音實測。**原本那 55 筆的音檔已被 ZeroType 清掉**，
-所以對照文字是 MOSS 當時的輸出，不是人工校對。下面的差異只能說明「兩者不同」，不能說明誰比較準。
-
-| 項目 | 結果 |
-|---|---|
-| 去標點後與 MOSS 完全相同 | 31 / 60 筆 |
-| 去標點後字元差異中位數 | 0 |
-| 延遲中位數 | 0.47 秒（第一句 2.9 秒，所以要暖機） |
-| VRAM 峰值 | 約 2.7 GB（MOSS 約 1.8 GB） |
-
-從差異逐筆看到的傾向（判讀，沒有音檔可對）：
-
-- FireRed 對中文詞較準：有幾筆會計與專案用語 MOSS 寫錯，FireRed 寫對。
-- FireRed 對英文詞較差：英文產品名、系統名、英文人名大多寫錯，常被音譯成中文。
-- FireRed 把數字寫成國字（例如五位數的編號被逐字寫成國字）。
-- FireRed 沒有文字輸入，熱詞改在解碼時加權，見下一節。
-
-**短句不走 VAD。** 走 VAD 時每個停頓都被切成一段、各自補句號（「若我想。知道這一個影片裡面的。字幕。」）。
-50 秒以下的錄音整段直接送，句號數中位數從 1.5 降到 1，與 MOSS 的字元差異中位數從 0.036 降到 0。
-超過 50 秒才走 VAD，因為 AED 一段最多 60 秒。
-
 ## 熱詞怎麼送
 
 ZeroType 的字典詞彙以 `hotwords` 表單欄位送進來，shim 再接到轉寫指令後面。
@@ -186,35 +126,15 @@ ZeroType 的字典詞彙以 `hotwords` 表單欄位送進來，shim 再接到轉
 
 同樣的理由，shim 刻意完全忽略 `prompt` 欄位。
 
-### FireRed 的熱詞加權
-
-FireRedASR2-AED 只吃聲音，沒有地方放熱詞。`firered_bias.py` 改在 beam search 每一步，
-替「正在拼出字典詞」的 token 加分；拼到一半斷掉就扣回，拼完整個詞才保留。
-它在執行時替換上游的 `batch_beam_search`，不必改 FireRedASR2S 的 clone。
-英文熱詞的大小寫也照字典寫回（FireRed 的輸出全是小寫）。
-
-權重用 `--hotword-weight` 調，預設 3.0，0 是關閉。2026-10-21 用 100 筆 ZeroType 錄音實測：
-60 筆 MOSS 文字含字典詞、40 筆不含。字典 13 個詞。
-
-**熱詞要先轉簡體。** FireRed 的字表只有簡體字，繁體的「時」「燈」「號」「組」「織」「圖」都不在裡面。
-`firered_bias.py` 會先用 OpenCC `t2s` 轉換再切 token，否則含這些字的詞全部被略過。
-下表權重 0～6 那幾列是修正前量的（13 詞只用上 10 詞）；修正後權重 3 重量一次：13 詞全用上，
-命中仍是 35 / 63，多出的一筆「誤加」是 MOSS 寫「登號」、FireRed 寫「燈號」，判讀為 FireRed 正確。
-
-| 權重 | 字典詞命中 | 誤加（人工判讀） | 不含字典詞的 40 筆 |
-|---|---|---|---|
-| 0 | 11 / 63 | 0 | 與 MOSS 差異中位數 0 |
-| 3 | 35 / 63 | 0 | 0 |
-| 4.5 | 44 / 63 | 約 3 | 0 |
-| 6 | 51 / 63 | 大量亂插 | 0.400 |
-
-「誤加」欄是逐筆看過的：自動統計在權重 3 時算出 2 筆，但兩筆都是 MOSS 當時聽錯、
-FireRed 加權後才對（例如 MOSS 寫「潘」，實際講的是 PANE）。
-
-**每個詞在一條候選句裡只加分一次。** 沒有這條限制時，權重 4.5 起模型會無限重複字典詞
-（「Session Session Session…」）來賺加分。代價是同一句講兩次同一個詞，第二次不加分。
-
 ## 待辦
 
 - 熱詞對專有名詞的實際改善幅度**尚未量測**。程式路徑已通，但沒有重跑 55 筆測試集
   比較「有熱詞／無熱詞」的 CER。要量的話跑 `eval/run_test.py`。
+
+## FireRed 引擎（已移除）
+
+2026-10-21 加入 FireRedASR2-AED 引擎與熱詞加權（`firered_bias.py`，在 beam search 替字典詞加分），
+2026-10-31 整組移除，工具資料夾也刪了。程式碼留在 git 歷史（584c4ba、d3a26f1、3940c18）。
+
+移除原因：使用者實際用了約 900 次，覺得英文詞太差（產品名常被音譯成中文）、長句偏慢，偏好 MOSS。
+當時的實測：中文詞比 MOSS 準一些；英文、人名較差；數字寫成國字；VRAM 峰值約 2.7 GB（MOSS 約 1.8 GB）。
