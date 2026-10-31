@@ -306,7 +306,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8123)
-    # 只剩 moss。ZeroType 選單若仍選 FireRed，會帶 --engine firered，這裡直接報錯而不是默默換成 MOSS。
+    # 只剩 moss。ZeroType v1.0.35 起選單已無 FireRed；舊的啟動設定若仍帶 --engine firered，
+    # 這裡直接報錯而不是默默換成 MOSS。
     ap.add_argument("--engine", choices=["moss"], default="moss")
     # 這個旗標在檔案最上方就已經生效，這裡只是讓 argparse 不要拒收它。
     ap.add_argument("--hide-console", action="store_true",

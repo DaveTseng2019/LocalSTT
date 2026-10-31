@@ -6,8 +6,6 @@
 引擎是 [OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize) 0.9B
 （Apache-2.0），權重 revision `704aa4a9c304e8520be88901e0d1960158ef5b15`，虛擬環境在 `repo/.venv`（ZeroType 預設找這個）。
 
-FireRed 引擎曾經存在，2026-10-31 移除，見最後的「FireRed 引擎（已移除）」。
-
 ## 需求
 
 - NVIDIA GPU，2 GB 以上可用 VRAM（實測峰值 1808 MiB）。
@@ -130,11 +128,3 @@ ZeroType 的字典詞彙以 `hotwords` 表單欄位送進來，shim 再接到轉
 
 - 熱詞對專有名詞的實際改善幅度**尚未量測**。程式路徑已通，但沒有重跑 55 筆測試集
   比較「有熱詞／無熱詞」的 CER。要量的話跑 `eval/run_test.py`。
-
-## FireRed 引擎（已移除）
-
-2026-10-21 加入 FireRedASR2-AED 引擎與熱詞加權（`firered_bias.py`，在 beam search 替字典詞加分），
-2026-10-31 整組移除，工具資料夾也刪了。程式碼留在 git 歷史（584c4ba、d3a26f1、3940c18）。
-
-移除原因：使用者實際用了約 900 次，覺得英文詞太差（產品名常被音譯成中文）、長句偏慢，偏好 MOSS。
-當時的實測：中文詞比 MOSS 準一些；英文、人名較差；數字寫成國字；VRAM 峰值約 2.7 GB（MOSS 約 1.8 GB）。
