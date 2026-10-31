@@ -178,13 +178,12 @@ shim 本身不用時間戳（`return_timestamp=False`），所以不修也能辨
 
 ## 熱詞怎麼送
 
-ZeroType 的字典詞彙以 `hotwords` 表單欄位送進來，shim 再接到轉寫指令後面。
+ZeroType 的字典詞彙以 `hotwords` 表單欄位送進來，送出的是純詞彙列表（`欣興電子、臺積電`）。
 
-送出的是純詞彙列表（`欣興電子、臺積電`），**不是** ZeroType `buildDictionaryPrompt()`
-產生的那段指令文。理由跟 `shim.py` 註解記的是同一件事：MOSS 在音訊內容偏弱時，
-會把 prompt 裡的指令本身當答案抄出來。詞彙列表沒有指令語氣，抄出來的風險低得多。
+**MOSS 不接熱詞。** 2026-10-31 起 shim 對 MOSS 忽略 `hotwords`，指令固定是 `TRANSCRIBE_PROMPT`，
+讓流程保持單純。之前是把詞彙列表以「熱詞提示：」接在指令後面。只有 FireRed 還用熱詞（見下一節）。
 
-同樣的理由，shim 刻意完全忽略 `prompt` 欄位。
+shim 也刻意完全忽略 `prompt` 欄位：MOSS 在音訊內容偏弱時，會把 prompt 裡的指令本身當答案抄出來。
 
 ### FireRed 的熱詞加權
 
