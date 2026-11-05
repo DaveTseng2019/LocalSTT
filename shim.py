@@ -229,12 +229,46 @@ def _audio_seconds(path: str) -> float | None:
         return None
 
 
+PERF_HEADER = ("時間\t耗時s\tms/token\t字數\t音長s\tGPU負載%\t顯示記憶體已用/總共MiB\t本程序MiB\t時脈MHz\t效能狀態"
+               "\t輸入tokens\t產生tokens\t原始字數")
+
+
+def _ms_per_token(elapsed: float, gen_tokens: int) -> str:
+    """監控速度用的主要數字：正常約 34～48；超過 120 多半是又被節流了。含音訊編碼時間，短句會偏高。"""
+    return f"{elapsed / gen_tokens * 1000:.0f}" if gen_tokens else ""
+
+
+def _migrate_perf_log() -> None:
+    """舊版 perf.log 沒有 ms/token 欄：補上標題，並用舊列的耗時與產生 tokens 算出來插進第 3 欄。"""
+    try:
+        lines = PERF_LOG.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if not lines or "ms/token" in lines[0]:
+        return
+    out = [PERF_HEADER]
+    for line in lines[1:]:
+        f = line.split("\t")
+        if len(f) == 12:  # 舊格式：…輸入tokens、產生tokens、原始字數
+            try:
+                f.insert(2, _ms_per_token(float(f[1]), int(f[10])))
+            except ValueError:
+                f.insert(2, "")
+        out.append("\t".join(f))
+    try:
+        PERF_LOG.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+_migrate_perf_log()
+
+
 def perf_log(elapsed: float, chars: int, audio_s: float | None, gpu: dict,
              prompt_len: int = 0, gen_tokens: int = 0, raw_chars: int = 0) -> None:
-    """一句一行，tab 分隔：日期時間、耗時、字數、音長、GPU 負載%、已用/總共 MiB、本程序保留 MiB、時脈、效能狀態、
-    輸入 tokens、產生 tokens、原始輸出字數（清理前）。"""
+    """一句一行，tab 分隔，欄位見 PERF_HEADER。ms/token 放第 3 欄，打開檔案就看得到速度。"""
     own = torch.cuda.memory_reserved() // 2**20 if torch.cuda.is_available() else 0
-    row = [time.strftime("%Y-%m-%d %H:%M:%S"), f"{elapsed:.2f}", str(chars),
+    row = [time.strftime("%Y-%m-%d %H:%M:%S"), f"{elapsed:.2f}", _ms_per_token(elapsed, gen_tokens), str(chars),
            f"{audio_s:.1f}" if audio_s is not None else "",
            gpu.get("util", ""), f"{gpu.get('used', '')}/{gpu.get('total', '')}", str(own),
            gpu.get("clock", ""), gpu.get("pstate", gpu.get("error", "")),
@@ -243,7 +277,7 @@ def perf_log(elapsed: float, chars: int, audio_s: float | None, gpu: dict,
         new = not PERF_LOG.exists()
         with PERF_LOG.open("a", encoding="utf-8") as f:
             if new:
-                f.write("時間\t耗時s\t字數\t音長s\tGPU負載%\t顯示記憶體已用/總共MiB\t本程序MiB\t時脈MHz\t效能狀態\t輸入tokens\t產生tokens\t原始字數\n")
+                f.write(PERF_HEADER + "\n")
             f.write("\t".join(row) + "\n")
     except OSError:
         pass
@@ -393,7 +427,9 @@ async def transcriptions(
 
     if response_format == "text":
         return text
-    return {"text": text}
+    # usage 照 OpenAI 轉寫回應的欄位名稱，ZeroType 的記錄分頁會顯示 in/out tokens 並算 ms/token
+    return {"text": text, "usage": {"input_tokens": result.get("prompt_len"),
+                                    "output_tokens": result.get("generated_tokens")}}
 
 
 def main() -> None:
