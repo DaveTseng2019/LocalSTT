@@ -12,6 +12,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import wave
 from pathlib import Path
@@ -120,6 +121,35 @@ _console = None if "--hide-console" in sys.argv else _console_stream()
 sys.stdout = _Tee(LOG_PATH, _console or sys.__stdout__)
 sys.stderr = _Tee(LOG_PATH, _console or sys.__stderr__)
 
+
+def _disable_power_throttling() -> None:
+    """關掉 Windows 對這個程序的節能節流（EcoQoS）。
+
+    pythonw 沒有視窗，Windows 把它當背景程序節流：排到效率核心、壓低時脈。MOSS 逐字產生時
+    每個 token 都要 CPU 送一批小工作給顯示卡，CPU 一慢，顯示卡就閒著、驅動再把它降頻。
+    2026-11-05 實測同一段 13.7 秒錄音：節流中 6.7～8.2 秒（221～665 ms/token，十多次），
+    關掉後 0.96 秒（34 ms/token，3 次）。
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    class _State(ctypes.Structure):
+        _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong), ("StateMask", ctypes.c_ulong)]
+
+    # Version 1；ControlMask=EXECUTION_SPEED(1) 表示「由我指定」；StateMask=0 表示「不要節流」
+    st = _State(1, 1, 0)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    k32.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+    ProcessPowerThrottling = 4
+    ok = k32.SetProcessInformation(k32.GetCurrentProcess(), ProcessPowerThrottling, ctypes.byref(st), ctypes.sizeof(st))
+    print(f"{time.strftime('%H:%M:%S')} 節能節流：{'已關閉' if ok else f'關閉失敗（錯誤碼 {ctypes.get_last_error()}），長句可能變慢'}",
+          flush=True)
+
+
+_disable_power_throttling()
+
 import torch  # noqa: E402
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, Form, UploadFile
@@ -164,6 +194,59 @@ state: dict = {}
 def log(message: str) -> None:
     """加時間戳的訊息。寫進記錄檔這件事由 _Tee 負責，這裡只管格式。"""
     print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
+
+
+# ---- 效能紀錄：每句記下耗時與顯示卡狀態 ----
+# 2026-11-04 有 32/114 句超過 3 秒，原因是節能節流（見 _disable_power_throttling）。shim.log 每次啟動清空，
+# 事後查不到，所以每句另寫一行到 perf.log（只附加、不清空）。再變慢時先看 ms/token（正常約 34～48）。
+PERF_LOG = Path(__file__).with_name("perf.log")
+
+
+def _gpu_snapshot() -> dict:
+    """呼叫 nvidia-smi 取整張卡的負載、顯示記憶體、時脈與效能狀態（含別的程式）。
+
+    notes: 每句多一次 nvidia-smi（約 0.1～0.3 秒），放在背景執行緒與推論同時跑，
+           不加進回應時間。取到的是「推論開始那一刻」的狀態，不是推論期間的峰值。
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,clocks.sm,pstate",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout.strip().split(", ")
+        return {"util": out[0], "used": out[1], "total": out[2], "clock": out[3], "pstate": out[4]}
+    except Exception as e:  # 記錄不能拖垮辨識
+        return {"error": type(e).__name__}
+
+
+def _audio_seconds(path: str) -> float | None:
+    try:
+        with wave.open(path, "rb") as w:
+            return w.getnframes() / w.getframerate()
+    except Exception:
+        return None
+
+
+def perf_log(elapsed: float, chars: int, audio_s: float | None, gpu: dict,
+             prompt_len: int = 0, gen_tokens: int = 0, raw_chars: int = 0) -> None:
+    """一句一行，tab 分隔：日期時間、耗時、字數、音長、GPU 負載%、已用/總共 MiB、本程序保留 MiB、時脈、效能狀態、
+    輸入 tokens、產生 tokens、原始輸出字數（清理前）。"""
+    own = torch.cuda.memory_reserved() // 2**20 if torch.cuda.is_available() else 0
+    row = [time.strftime("%Y-%m-%d %H:%M:%S"), f"{elapsed:.2f}", str(chars),
+           f"{audio_s:.1f}" if audio_s is not None else "",
+           gpu.get("util", ""), f"{gpu.get('used', '')}/{gpu.get('total', '')}", str(own),
+           gpu.get("clock", ""), gpu.get("pstate", gpu.get("error", "")),
+           str(prompt_len), str(gen_tokens), str(raw_chars)]
+    try:
+        new = not PERF_LOG.exists()
+        with PERF_LOG.open("a", encoding="utf-8") as f:
+            if new:
+                f.write("時間\t耗時s\t字數\t音長s\tGPU負載%\t顯示記憶體已用/總共MiB\t本程序MiB\t時脈MHz\t效能狀態\t輸入tokens\t產生tokens\t原始字數\n")
+            f.write("\t".join(row) + "\n")
+    except OSError:
+        pass
 
 
 def clean(text: str) -> str:
@@ -279,6 +362,9 @@ async def transcriptions(
 
     try:
         t0 = time.perf_counter()
+        gpu: dict = {}
+        snap = threading.Thread(target=lambda: gpu.update(_gpu_snapshot()), daemon=True)
+        snap.start()
         instruction = TRANSCRIBE_PROMPT
         if hotwords.strip():
             instruction = f"{instruction}熱詞提示：{hotwords.strip()}"
@@ -294,6 +380,14 @@ async def transcriptions(
         text = clean(result["text"])
         elapsed = time.perf_counter() - t0
         log(f"[{ENGINE}] {elapsed:.2f}s {len(text)} 字：{text[:60]}")
+        snap.join(timeout=5)
+        audio_s = _audio_seconds(audio_path)
+        toks = result.get("generated_tokens", 0)
+        perf_log(elapsed, len(text), audio_s, gpu, result.get("prompt_len", 0), toks, len(result["text"]))
+        log(f"  GPU {gpu.get('util', '?')}% {gpu.get('used', '?')}/{gpu.get('total', '?')} MiB "
+            f"{gpu.get('pstate', gpu.get('error', '?'))}，音長 {audio_s if audio_s is None else round(audio_s, 1)}s，"
+            f"輸入 {result.get('prompt_len', '?')} tokens，產生 {toks} tokens"
+            f"（{elapsed / toks * 1000 if toks else 0:.0f} ms/token），原始輸出 {len(result['text'])} 字")
     finally:
         Path(audio_path).unlink(missing_ok=True)
 

@@ -56,6 +56,11 @@ C:\Learning\LocalSTT\start.ps1
 - `GET /health` — 是否已載入完成
 - `POST /shutdown` — 自行結束，收回 GPU 記憶體
 - `shim.log` — 每一句的耗時與結果，每次啟動清空
+- `perf.log` — 每一句一行：耗時、音長、顯示卡負載／記憶體／時脈、產生的 tokens。只附加、不清空，不進版控
+
+**長句變慢先看這裡。** 正常約 34～48 ms/token（shim.log 每句第二行）。
+shim 啟動時會關掉 Windows 對這個程序的節能節流（EcoQoS），shim.log 開頭會印「節能節流：已關閉」。
+沒關掉的話，沒有視窗的 pythonw 會被當背景程序降速，2026-11-05 實測同一段 13.7 秒錄音從 1 秒變成 7～8 秒。
 
 ## 開機自啟（不搭配 ZeroType 時）
 
@@ -91,9 +96,10 @@ C:\Learning\LocalSTT\install-autostart.ps1
 
 | 路徑 | 用途 |
 |---|---|
-| `shim.py` | OpenAI 相容端點。含暖機、剝時間戳標記、簡轉繁 |
+| `shim.py` | OpenAI 相容端點。含暖機、剝時間戳標記、簡轉繁、關閉節能節流、效能紀錄 |
 | `start.ps1` | 啟動腳本 |
 | `shim.log` | 端點記錄，ZeroType 讀這個檔顯示。每次啟動清空 |
+| `perf.log` | 每句的耗時與顯示卡狀態，只附加。不進版控 |
 | `install-autostart.ps1` | 註冊／移除登入自啟的工作排程項目 |
 | `repo/` | 上游 clone ＋ `.venv`（7.7 GB）。不進版控 |
 | `eval/` | 評估用的測試集、批次腳本與原始輸出。內容是維護者本人的錄音逐字稿，不進版控 |
