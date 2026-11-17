@@ -283,14 +283,34 @@ def perf_log(elapsed: float, chars: int, audio_s: float | None, gpu: dict,
         pass
 
 
-def clean(text: str) -> str:
-    """兩道確定性後處理。程式碼能答的不交給模型。
+def hotword_labels(hotwords: str) -> re.Pattern | None:
+    """熱詞被模型當成說話者名字時的標籤，例如行首的「Becky:」。
+
+    notes: moss-transcribe-diarize 會標說話者。熱詞接在指令後面時，它把熱詞清單裡的詞
+           當成名字，輸出「Becky: 寫一份關於」。2026-11-17 實測 10 段錄音，完整詞典每段都
+           重現；拿掉 Becky 後，3 段清楚的錄音就正確了。只剝熱詞本身，不剝任意「英文字:」，
+           因為使用者可能真的唸出「注意: 」這類句子。弱音訊時模型也會編出 Hank、PANCAKE
+           這種不在詞典裡的名字，這裡不處理；要處理得改成剝任何行首短英文標籤。
+    """
+    words = [w.strip() for w in re.split(r"[、,，\n]", hotwords) if w.strip()]
+    if not words:
+        return None
+    alt = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
+    return re.compile(rf"^[ \t]*(?:{alt})[ \t]*[:：][ \t]*", re.IGNORECASE | re.MULTILINE)
+
+
+def clean(text: str, hotwords: str = "") -> str:
+    """三道確定性後處理。程式碼能答的不交給模型。
 
     notes: 剝標記是無條件的。自訂 prompt 實測有 7/55 筆無視指令、照樣吐時間戳，
            所以不能假設 prompt 生效。簡轉繁同理——55 筆裡 30 筆含簡體字，prompt
-           寫「繁體中文」壓不住。
+           寫「繁體中文」壓不住。熱詞標籤見 hotword_labels。
     """
-    return cc.convert(MARKER.sub("", text)).strip()
+    text = MARKER.sub("", text)
+    labels = hotword_labels(hotwords)
+    if labels:
+        text = labels.sub("", text)
+    return cc.convert(text).strip()
 
 
 def warmup() -> None:
@@ -411,7 +431,7 @@ async def transcriptions(
             device=state["device"],
             dtype=state["dtype"],
         )
-        text = clean(result["text"])
+        text = clean(result["text"], hotwords)
         elapsed = time.perf_counter() - t0
         log(f"[{ENGINE}] {elapsed:.2f}s {len(text)} 字：{text[:60]}")
         snap.join(timeout=5)
