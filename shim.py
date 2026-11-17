@@ -299,6 +299,50 @@ def hotword_labels(hotwords: str) -> re.Pattern | None:
     return re.compile(rf"^[ \t]*(?:{alt})[ \t]*[:：][ \t]*", re.IGNORECASE | re.MULTILINE)
 
 
+# ---- 弱音訊幻覺的兩道關卡（2026-11-17，ZeroType 691 筆紀錄的錄音與文字） ----
+# notes: 門檻來自單一使用者、單一麥克風、7 天的紀錄。換人或換麥克風時要重新量。
+#        量法：每筆算音長與「字數 ÷ 音長」，看幻覺與正常的分界。
+
+# 短於 0.6 秒的 5 筆全部是幻覺（Becky:、指令原文、「好的，那我們現在就開始」），
+# 正常的最短一筆是 0.73 秒的「聲音」。ZeroType 的動態範圍關卡只管 1 秒以上，
+# 這段沒人擋。「woman」那筆實際 0.598 秒，也會被擋；使用者不太可能說這個字，當成幻覺。
+MIN_AUDIO_S = 0.6
+
+# 1.2 秒以上、6 個單位以上的正常紀錄 584 筆：p99 = 4.8、最高 6.3 單位／秒（單位見 spoken_units）。
+# 幻覺迴圈那筆約 200。12 是正常最高值的近兩倍。短字串不判，避免單一字被短音長放大。
+MAX_CHARS_PER_S = 12
+MIN_CHARS_FOR_RATE = 6
+
+
+_SPOKEN_UNIT = re.compile(r"[㐀-鿿豈-﫿]|[A-Za-z0-9]+")
+
+
+def spoken_units(text: str) -> int:
+    """唸出來的單位數：一個漢字算一個，一個英文字或一串數字也算一個。
+
+    notes: 不用 len(text)。英文按字母算，一句英文每秒會有十幾個字元，被誤判成太快。
+    """
+    return len(_SPOKEN_UNIT.findall(text))
+
+
+def too_fast(text: str, audio_s: float | None) -> bool:
+    """唸的單位相對音長多到人講不出來，就是模型在迴圈或抄指令。"""
+    units = spoken_units(text)
+    if not audio_s or units < MIN_CHARS_FOR_RATE:
+        return False
+    return units / audio_s > MAX_CHARS_PER_S
+
+
+def max_tokens_for(audio_s: float | None) -> int:
+    """依音長限制產生的 token 數，讓幻覺迴圈早點停。
+
+    notes: 原本固定 2048。9.2 秒的錄音迴圈到 1862 字才停，白白多跑十幾秒。
+           上限取每秒 20 個 token 加 40，比 MAX_CHARS_PER_S 寬，所以不會截斷正常句子；
+           截斷的輸出一定超過字速上限，會被 too_fast 丟掉。量不到音長時維持 2048。
+    """
+    return 2048 if audio_s is None else min(2048, int(audio_s * 20) + 40)
+
+
 def clean(text: str, hotwords: str = "") -> str:
     """三道確定性後處理。程式碼能答的不交給模型。
 
@@ -415,6 +459,10 @@ async def transcriptions(
         audio_path = tmp.name
 
     try:
+        audio_s = _audio_seconds(audio_path)
+        if audio_s is not None and audio_s < MIN_AUDIO_S:
+            log(f"[{ENGINE}] 略過：音長 {audio_s:.3f}s 短於 {MIN_AUDIO_S}s，送進模型只會得到幻覺")
+            return "" if response_format == "text" else {"text": "", "usage": {"input_tokens": 0, "output_tokens": 0}}
         t0 = time.perf_counter()
         gpu: dict = {}
         snap = threading.Thread(target=lambda: gpu.update(_gpu_snapshot()), daemon=True)
@@ -426,7 +474,7 @@ async def transcriptions(
             state["model"],
             state["processor"],
             build_transcription_messages(audio_path, prompt=instruction),
-            max_new_tokens=2048,
+            max_new_tokens=max_tokens_for(audio_s),
             do_sample=False,
             device=state["device"],
             dtype=state["dtype"],
@@ -434,8 +482,10 @@ async def transcriptions(
         text = clean(result["text"], hotwords)
         elapsed = time.perf_counter() - t0
         log(f"[{ENGINE}] {elapsed:.2f}s {len(text)} 字：{text[:60]}")
+        if too_fast(text, audio_s):
+            log(f"[{ENGINE}] 丟棄：{len(text)} 字／{audio_s:.1f}s 超過每秒 {MAX_CHARS_PER_S} 字，人講不了這麼快，是模型幻覺")
+            text = ""
         snap.join(timeout=5)
-        audio_s = _audio_seconds(audio_path)
         toks = result.get("generated_tokens", 0)
         perf_log(elapsed, len(text), audio_s, gpu, result.get("prompt_len", 0), toks, len(result["text"]))
         log(f"  GPU {gpu.get('util', '?')}% {gpu.get('used', '?')}/{gpu.get('total', '?')} MiB "
